@@ -59,16 +59,69 @@ At query time, `auto` uses the backend/model stored in the index. An explicit
 backend mismatch fails instead of silently using a different model. If vectors
 are unavailable, `auto` reports lexical fallback in `retrieval_debug`.
 
+## Overall architecture
+
+VeRAG builds its knowledge index offline, then uses a shared LangChain LCEL
+pipeline for online retrieval. Answer generation is optional.
+
+```mermaid
+flowchart TB
+    subgraph offline["Offline · Knowledge indexing"]
+        sources["Verus projects · Tutorials / API docs · PDFs"]
+        parse["Read sources and resolve local mdBook includes"]
+        chunks["Source-preserving chunks<br/>Code regions · Sections · PDF pages"]
+        evidence["Evidence text + IDs + source locations"]
+        lexical["Compute lexical term counts"]
+        embeddings["Encode document vectors<br/>Projection or local SentenceTransformer"]
+        snapshot[("Versioned local snapshot<br/>chunks.jsonl · lexical.json · vectors.npy")]
+        sources --> parse --> chunks --> evidence
+        evidence --> lexical --> snapshot
+        evidence --> embeddings --> snapshot
+    end
+
+    subgraph online["Online · LangChain LCEL retrieval chain"]
+        entry["CLI · Python API · Evaluation"]
+        request["Validate request<br/>English question + optional code / Verus errors"]
+        analyze["Analyze query<br/>Spec clauses · Error categories · Proof hints"]
+        bm25["BM25 lexical retrieval"]
+        dense["Encode query + vector retrieval"]
+        fusion["RRF rank fusion"]
+        select["Evidence selection<br/>Overlap / near-duplicate removal · Repo limits"]
+        documents["LangChain Documents<br/>Full evidence + citation metadata"]
+        context["Pack complete evidence blocks<br/>Character budget + source citations"]
+        output["Retrieval output<br/>Ranked evidence · Scores · prompt_pack"]
+        entry --> request --> analyze
+        analyze --> bm25
+        analyze --> dense
+        bm25 --> fusion
+        dense --> fusion
+        fusion --> select --> documents --> context --> output
+    end
+
+    snapshot --> bm25
+    snapshot --> dense
+
+    subgraph generation["Optional · LangChain answer chain"]
+        prompt["Grounded chat prompt<br/>Question + code + errors + evidence"]
+        model["Caller-provided chat model"]
+        answer["Answer with evidence references<br/>Suggestions, not verifier-validated proofs"]
+        prompt --> model --> answer
+    end
+
+    context -.-> prompt
+    request -.-> prompt
+```
+
+BM25 and vector search retrieve independently before fusion. Document vectors are
+computed at build time; only the query is encoded online. The default projection
+backend uses deterministic feature hashing, not a learned semantic model. A new
+index snapshot becomes active only after a successful build. The optional answer
+chain does not execute Verus.
+
 ## LangChain orchestration
 
 The top-level framework is **LangChain LCEL**, supplied by `langchain-core`.
-CLI, `query_index()` and evaluation all invoke the same chain:
-
-```text
-validate request -> Verus hybrid retrieval -> LangChain Documents -> evidence context
-                                                                    |
-                                                   optional chat prompt -> LLM -> answer
-```
+CLI, `query_index()` and evaluation all invoke the same retrieval chain shown above.
 
 ```python
 from rag import create_retrieval_chain, create_answer_chain
