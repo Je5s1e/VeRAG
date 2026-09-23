@@ -13,29 +13,15 @@ import re
 from collections import Counter
 
 from .tokenize import token_counts, tokenize
+from .chunking import mask_non_code
 
 # ── Spec clause extraction ────────────────────────────────────────────────────
-
-# Match ensures/requires/invariant blocks (non-greedy up to next keyword or '{')
-_SPEC_BLOCK_RE = re.compile(
-    r"\b(ensures|requires|invariant|decreases)\b(.*?)(?=\brequires\b|\bensures\b|\binvariant\b|\bdecreases\b|\{|$)",
-    re.DOTALL,
-)
-
-# Match spec/proof function definitions
-_SPEC_FN_RE = re.compile(r"\b(?:spec|proof)\s+fn\s+(\w+)")
-
-# Match forall/exists quantifier variable names
-_QUANT_VAR_RE = re.compile(r"\b(?:forall|exists)\s*\|([^|]+)\|")
 
 # Match types like Vec<i32>, Seq<u64>, &[T], usize, nat, int
 _TYPE_RE = re.compile(
     r"\bVec\s*<\s*(\w+)\s*>|\bSeq\s*<\s*(\w+)\s*>|\bi8\b|\bi16\b|\bi32\b|\bi64\b"
     r"|\bu8\b|\bu16\b|\bu32\b|\bu64\b|\bi128\b|\bu128\b|\busize\b|\bnat\b|\bisize\b"
 )
-
-# Match arithmetic comparison patterns in spec context
-_ARITH_CMP_RE = re.compile(r"([a-zA-Z_]\w*)\s*([<>]=?|==)\s*([a-zA-Z_]\w*)")
 
 # ── Proof pattern signatures ──────────────────────────────────────────────────
 
@@ -65,11 +51,35 @@ def _extract_spec_clauses(code: str) -> dict[str, str]:
         "invariant": [],
         "decreases": [],
     }
-    for m in _SPEC_BLOCK_RE.finditer(code):
-        kw = m.group(1).lower()
-        body = m.group(2).strip()
-        if kw in clauses:
-            clauses[kw].append(body)
+    masked = mask_non_code(code)
+    # Walk balanced clause expressions; a quantifier block is not a function body.
+    keywords = re.compile(r"\b(ensures|requires|invariant|decreases)\b")
+    position = 0
+    while True:
+        match = keywords.search(masked, position)
+        if match is None:
+            break
+        start = match.end()
+        i = start
+        depth = 0
+        while i < len(masked):
+            if depth == 0 and keywords.match(masked, i):
+                break
+            ch = masked[i]
+            if ch == "{" and depth == 0:
+                prefix = masked[start:i].rstrip()
+                # Quantifier closures commonly use forall|x: T| { ... }.
+                if not prefix.endswith("|"):
+                    break
+            if ch in "({[":
+                depth += 1
+            elif ch in ")}]":
+                if depth == 0:
+                    break
+                depth -= 1
+            i += 1
+        clauses[match.group(1)].append(code[start:i].strip())
+        position = max(i, match.end())
     return {k: " ".join(v) for k, v in clauses.items()}
 
 
@@ -79,7 +89,7 @@ def _detect_proof_patterns(code: str) -> list[str]:
     detected: list[str] = []
     for name, signals in PROOF_PATTERNS.items():
         for sig in signals:
-            if sig.lower() in code_lower:
+            if re.search(r"(?<![a-z0-9_])" + re.escape(sig.lower()) + r"(?![a-z0-9_])", code_lower):
                 detected.append(name)
                 break
     return detected

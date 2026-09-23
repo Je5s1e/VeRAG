@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+/build/
+/dist/
+/.rag_index/
+/.rag_eval/
+.coverage
+
+# Developer state and secrets
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.env
+.env.*
+!.env.example
+*.log
+/rag/model/
+
+# Local historical run reports (reproducible tests live in tests/evaluation)
+/rag/retrieval_report_all_examples.json
+/rag/retrieval_report_data.json
+/rag/verus_run_results.json
+
+# Vendored generated documentation: keep attribution/license/source notes
+/projects/vest-main/docs/*
+!/projects/vest-main/docs/*.md
+!/projects/vest-main/docs/*.txt
+
+# Upstream benchmark inputs unused by the RAG source loaders
+/projects/vest-main/tools/wasmbin/benches/fixture.wasm
+/projects/vest-main/tools/top_1M_tranco.txt
+/projects/vest-main/vest-dsl/wasm/benches/data/

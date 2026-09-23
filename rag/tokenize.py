@@ -44,7 +44,9 @@ STOPWORDS = {
 
 
 def normalize_token(token: str) -> str:
-    return token.strip().lower()
+    value = token.strip().lower()
+    return {"invariants": "invariant", "loops": "loop", "preconditions": "precondition",
+            "postconditions": "postcondition", "quantifiers": "quantifier"}.get(value, value)
 
 
 def tokenize(text: str) -> list[str]:

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "VeRAG"
+version = "0.2.0"
+description = "Local, evidence-preserving retrieval for Verus proofs and documentation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "langchain-core>=0.3.79,<2"]
+
+[project.optional-dependencies]
+pdf = ["pypdf>=5.0.0"]
+semantic = ["sentence-transformers>=3.0"]
+
+[project.scripts]
+verag = "rag.cli:main"
+
+[tool.setuptools]
+packages = ["rag"]

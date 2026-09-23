@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
-import re
 import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -15,6 +13,7 @@ from pathlib import Path
 from .code_analyzer import extract_spec_query_terms, get_proof_pattern_labels, get_spec_summary
 from .error_cleaner import clean_error_text, detect_error_categories, expand_terms_from_categories
 from .semantic import SemanticConfig, SemanticScorer
+from .storage import resolve_snapshot
 from .tokenize import jaccard_similarity, token_counts, unique_tokens
 
 K1 = 1.5
@@ -90,17 +89,6 @@ TUTORIAL_NOISE_PATH_PARTS = (
     "faq",
 )
 
-# Hard-exclude these path fragments entirely (will never appear in results)
-HARD_EXCLUDE_PATH_PARTS = (
-    "getting_started_cmd_line",
-    "getting_started_install",
-    "getting_started_vscode",
-    "getting_started",  # covers all getting_started_* variants
-    "changelog",
-    "contributing.md",
-    "license",
-)
-
 PATH_HINTS_BY_ERROR = {
     "invariant": ("invariants", "while", "properties", "state_machines", "quantproofs", "loop"),
     "precondition": ("requires-ensures", "mut-ref", "precondition", "spec", "requires"),
@@ -133,6 +121,10 @@ class RetrievedChunk:
     semantic_score: float
     rrf_score: float
     snippet: str
+    text: str
+    symbol: str
+    chunk_kind: str
+    includes: list[dict]
 
 
 def _load_chunks(index_dir: Path) -> list[dict]:
@@ -193,11 +185,6 @@ def _extract_hints(error_text: str) -> set[str]:
     return hints
 
 
-def _is_hard_excluded(path: str) -> bool:
-    path_l = path.lower()
-    return any(part in path_l for part in HARD_EXCLUDE_PATH_PARTS)
-
-
 def _path_adjustment(path: str, source_group: str, error_categories: list[str]) -> float:
     path_l = path.lower()
     adjust = 0.0
@@ -222,9 +209,11 @@ def _extract_repo_name(path: str) -> str:
 
 
 def _group_boost(
-    chunk: dict, query_tokens: set[str], hint_tokens: set[str], error_categories: list[str]
+    chunk: dict, query_tokens: set[str], hint_tokens: set[str], error_categories: list[str],
+    text_tokens: set[str] | None = None,
 ) -> float:
-    text_tokens = unique_tokens(chunk["text"])
+    if text_tokens is None:
+        text_tokens = unique_tokens(chunk["text"])
     jacc = jaccard_similarity(query_tokens, text_tokens)
 
     source_group = chunk.get("source_group", "tutorial")
@@ -250,15 +239,16 @@ def _dedup_key(item: RetrievedChunk) -> tuple[str, int]:
 
 
 def _is_near_dup(selected: list[RetrievedChunk], candidate: RetrievedChunk) -> bool:
-    if any(_dedup_key(s) == _dedup_key(candidate) for s in selected):
-        if any(abs(s.line_start - candidate.line_start) <= 8 for s in selected if s.path == candidate.path):
+    c_tokens = set(candidate.text.lower().split())
+    for existing in selected:
+        if existing.id == candidate.id:
             return True
-    c_tokens = set(candidate.snippet.lower().split())
-    for s in selected:
-        if s.path != candidate.path:
-            continue
-        s_tokens = set(s.snippet.lower().split())
-        if jaccard_similarity(c_tokens, s_tokens) > 0.87:
+        if _dedup_key(existing) == _dedup_key(candidate):
+            overlap = max(0, min(existing.line_end, candidate.line_end) - max(existing.line_start, candidate.line_start) + 1)
+            shorter = min(existing.line_end - existing.line_start + 1, candidate.line_end - candidate.line_start + 1)
+            if overlap / max(1, shorter) > 0.8:
+                return True
+        if jaccard_similarity(c_tokens, existing.text.lower().split()) > 0.95:
             return True
     return False
 
@@ -367,46 +357,39 @@ def _build_weighted_query_terms(
 def _load_cached_bm25(index_dir: str) -> tuple[list[dict], list[Counter[str]], dict[str, int], float]:
     path = Path(index_dir)
     chunks = _load_chunks(path)
-    tf_list, df, avg_len = _build_bm25_stats(chunks)
+    lexical_file = path / "lexical.json"
+    if lexical_file.exists():
+        tf_list = [Counter(row) for row in json.loads(lexical_file.read_text())]
+        if len(tf_list) != len(chunks):
+            raise ValueError("Lexical index/chunk count mismatch; rebuild index")
+        df = Counter(term for tf in tf_list for term in tf)
+        avg_len = sum(sum(tf.values()) for tf in tf_list) / max(1, len(tf_list))
+    else:
+        tf_list, df, avg_len = _build_bm25_stats(chunks)
     return chunks, tf_list, df, avg_len
 
 
-def _build_prompt_pack(selected: list[RetrievedChunk], max_chars: int = 6000) -> str:
-    lines: list[str] = []
-    total = 0
-    for i, item in enumerate(selected, 1):
-        loc = f"{item.path}:{item.line_start}-{item.line_end}"
-        if item.page > 0:
-            loc = f"{item.path}#page-{item.page}"
-        header = f"[{i}] ({item.source_group}) {loc}"
-        body = item.snippet
-        block = f"{header}\n{body}\n"
-        if total + len(block) > max_chars:
-            break
-        lines.append(block)
-        total += len(block)
-    return "\n".join(lines).strip()
+@lru_cache(maxsize=4)
+def _load_vectors(snapshot: str):
+    import numpy as np
+    return np.load(Path(snapshot) / "vectors.npy", mmap_mode="r", allow_pickle=False)
 
 
-# Thread-safe scorer singleton -------------------------------------------------
-# lru_cache 在多线程下非线程安全：N 个 worker 同时首次调用会各自创建 N 个实例
-# 并打印 N 次 sentence-transformers 警告。用双重检查锁保证只初始化一次。
+# Cache initialization can race even with lru_cache; serialize model construction.
 _scorer_lock: threading.Lock = threading.Lock()
 _scorer_cache: dict = {}
 
-# 静默 sentence-transformers 的 "Creating a new one with mean pooling" 警告
-logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 
 def _get_semantic_scorer(backend: str, model_name: str, proj_dim: int) -> SemanticScorer:
     key = (backend, model_name, proj_dim)
-    # 快速路径：无锁读（绝大多数调用走这里）
+    # Fast path for an initialized model.
     scorer = _scorer_cache.get(key)
     if scorer is not None:
         return scorer
-    # 慢速路径：加锁，防止多线程同时初始化
+    # Recheck under the lock before loading the model.
     with _scorer_lock:
-        scorer = _scorer_cache.get(key)   # 二次检查
+        scorer = _scorer_cache.get(key)
         if scorer is None:
             scorer = SemanticScorer(
                 SemanticConfig(
@@ -426,34 +409,47 @@ def _rrf_fuse(
     semantic_weight: float,
 ) -> dict[int, float]:
     scores: dict[int, float] = defaultdict(float)
-    for r, idx in enumerate(lexical_ranked_indices, 1):
+    for r, idx in enumerate(lexical_ranked_indices if lexical_weight > 0 else [], 1):
         scores[idx] += lexical_weight / (RRF_K + r)
-    for r, idx in enumerate(semantic_ranked_indices, 1):
+    for r, idx in enumerate(semantic_ranked_indices if semantic_weight > 0 else [], 1):
         scores[idx] += semantic_weight / (RRF_K + r)
     return dict(scores)
 
 
-def query_index(
+def _retrieve_index(
     index_dir: str | Path,
     query_text: str,
     code_text: str = "",
     error_text: str = "",
     top_k: int = 12,
     per_group_k: int = 6,
-    min_project: int = 2,
-    min_tutorial: int = 2,
-    min_pdf: int = 2,
+    min_project: int = 0,
+    min_tutorial: int = 0,
+    min_pdf: int = 0,
     semantic_backend: str = "auto",
-    semantic_model: str = "all-MiniLM-L6-v2",
-    semantic_proj_dim: int = 512,
+    semantic_model: str | None = None,
+    semantic_proj_dim: int | None = None,
     semantic_candidate_k: int = 1200,
     lexical_rrf_weight: float = 1.0,
-    semantic_rrf_weight: float = 0.9,
+    semantic_rrf_weight: float | None = None,
+    max_context_chars: int = 24000,
 ) -> dict:
-    index_path = str(Path(index_dir).resolve())
+    if top_k <= 0 or per_group_k <= 0 or semantic_candidate_k <= 0:
+        raise ValueError("top_k, per_group_k and semantic_candidate_k must be positive")
+    if min(min_project, min_tutorial, min_pdf, max_context_chars) < 0:
+        raise ValueError("Minimum counts and context budget must be nonnegative")
+    if semantic_backend not in {"none", "auto", "projection", "sentence-transformer"}:
+        raise ValueError(f"Unknown semantic backend: {semantic_backend}")
+    if not all(math.isfinite(w) and w >= 0 for w in (lexical_rrf_weight, semantic_rrf_weight) if w is not None):
+        raise ValueError("RRF weights must be finite and nonnegative")
+    snapshot, metadata = resolve_snapshot(index_dir)
+    # Legacy indexes bypass the cache; immutable generations have distinct paths.
+    index_path = str(snapshot)
+    if not metadata.get("generation"):
+        _load_cached_bm25.cache_clear()
+
     chunks, tf_list, df, avg_len = _load_cached_bm25(index_path)
-    if not chunks:
-        return {"results": [], "grouped": {"project": [], "tutorial": [], "pdf": []}}
+
 
     cleaned_error = clean_error_text(error_text)
     error_categories = detect_error_categories(cleaned_error)
@@ -466,13 +462,10 @@ def query_index(
     lexical_records: list[tuple[int, float, float, float]] = []
     n_docs = len(chunks)
     for idx, (ch, tf) in enumerate(zip(chunks, tf_list)):
-        # Hard-exclude noisy off-topic documents
-        if _is_hard_excluded(ch.get("path", "")):
-            continue
         base = _bm25(query_tf, tf, df, n_docs, avg_len)
         if base <= 0:
             continue
-        boost = _group_boost(ch, query_tokens, hint_tokens, error_categories)
+        boost = _group_boost(ch, query_tokens, hint_tokens, error_categories, set(tf))
         lexical = base + boost
         lexical_records.append((idx, lexical, base, boost))
 
@@ -488,27 +481,53 @@ def query_index(
     semantic_scores: dict[int, float] = {}
     semantic_ranked_indices: list[int] = []
     semantic_backend_used = "disabled"
-    if lexical_ranked_indices:
-        top_candidates = lexical_ranked_indices[: max(50, min(semantic_candidate_k, len(lexical_ranked_indices)))]
-        candidate_texts = [chunks[i]["text"] for i in top_candidates]
-        try:
-            scorer = _get_semantic_scorer(semantic_backend, semantic_model, semantic_proj_dim)
-            sims = scorer.score(semantic_query, candidate_texts)
-            semantic_backend_used = scorer.backend_name
-            for idx, s in zip(top_candidates, sims):
-                semantic_scores[idx] = s
-            semantic_ranked_indices = sorted(
-                top_candidates, key=lambda i: semantic_scores.get(i, 0.0), reverse=True
-            )
-        except Exception:
-            semantic_backend_used = "failed"
-            semantic_ranked_indices = []
+    degraded_reason = ""
+    embedding = metadata.get("embedding", {})
+    if semantic_backend != "none" and semantic_query and chunks:
+        if embedding.get("backend", "none") == "none":
+            if semantic_backend != "auto":
+                raise ValueError("Index has no persisted vectors; rebuild with the requested backend")
+            degraded_reason = "Index has no persisted vectors; lexical retrieval only"
+        else:
+            stored_backend = embedding["backend"]
+            if semantic_model is not None and semantic_model != embedding["model"]:
+                raise ValueError("Requested model differs from index; rebuild the index")
+            if semantic_proj_dim is not None and semantic_proj_dim != embedding["projection_dimension"]:
+                raise ValueError("Requested projection dimension differs from index; rebuild the index")
+            if semantic_backend != "auto" and semantic_backend != stored_backend:
+                raise ValueError("Requested backend differs from index; rebuild or use auto")
+            try:
+                scorer = _get_semantic_scorer(
+                    stored_backend, embedding["model"], embedding["projection_dimension"]
+                )
+                vectors = _load_vectors(index_path)
+                query_vector = scorer.embed([semantic_query])[0]
+                if vectors.shape != (len(chunks), len(query_vector)):
+                    raise ValueError("Vector index/chunk dimension mismatch; rebuild index")
+                similarities = vectors @ query_vector
+                # Independent corpus-wide retrieval, including lexical misses.
+                semantic_ranked_indices = sorted(
+                    (i for i, score in enumerate(similarities) if score > 0),
+                    key=lambda i: float(similarities[i]), reverse=True,
+                )[:semantic_candidate_k]
+                semantic_scores = {i: float(similarities[i]) for i in semantic_ranked_indices}
+                semantic_backend_used = scorer.backend_name
+                degraded_reason = embedding.get("degraded_reason", "")
+            except Exception as exc:
+                if semantic_backend != "auto":
+                    raise
+                semantic_backend_used = "failed"
+                degraded_reason = f"{type(exc).__name__}: {exc}"
 
+    # Feature hashing is a weaker signal than a learned embedding model.
+    effective_semantic_weight = semantic_rrf_weight
+    if effective_semantic_weight is None:
+        effective_semantic_weight = 0.25 if semantic_backend_used == "projection" else 0.9
     fused_scores = _rrf_fuse(
         lexical_ranked_indices,
         semantic_ranked_indices,
         lexical_weight=lexical_rrf_weight,
-        semantic_weight=semantic_rrf_weight if semantic_ranked_indices else 0.0,
+        semantic_weight=effective_semantic_weight if semantic_ranked_indices else 0.0,
     )
 
     lexical_by_idx = {idx: (lex, base, boost) for idx, lex, base, boost in lexical_records}
@@ -523,7 +542,7 @@ def query_index(
         lexical, _, boost = lexical_by_idx.get(idx, (0.0, 0.0, 0.0))
         sem = semantic_scores.get(idx, 0.0)
         rrf = fused_scores.get(idx, 0.0)
-        final = lexical + rrf * 100.0
+        final = rrf
         scored.append(
             RetrievedChunk(
                 score=round(final, 6),
@@ -543,6 +562,10 @@ def query_index(
                 semantic_score=round(sem, 6),
                 rrf_score=round(rrf, 6),
                 snippet=_trim_snippet(ch["text"]),
+                text=ch["text"],
+                symbol=ch.get("symbol", ""),
+                chunk_kind=ch.get("chunk_kind", "text"),
+                includes=ch.get("includes", []),
             )
         )
 
@@ -553,6 +576,7 @@ def query_index(
         "pdf": max(0, min_pdf if has_pdf else 0),
     }
     top_all = _pick_diversified(scored, top_k=top_k, group_minimum=group_minimum)
+    top_all.sort(key=lambda item: item.score, reverse=True)
 
     grouped: dict[str, list[dict]] = {"project": [], "tutorial": [], "pdf": []}
     for item in scored:
@@ -562,7 +586,8 @@ def query_index(
         if len(bucket) < per_group_k:
             bucket.append(item.__dict__)
 
-    return {
+    result = {
+        "index_generation": metadata.get("generation", "legacy"),
         "results": [x.__dict__ for x in top_all],
         "grouped": grouped,
         "query_terms": query_terms[:60],
@@ -573,10 +598,37 @@ def query_index(
         "group_minimum": group_minimum,
         "retrieval_debug": {
             "semantic_backend": semantic_backend_used,
+            "degraded_reason": degraded_reason,
+            "semantic_only_candidates": len(set(semantic_ranked_indices) - set(lexical_ranked_indices)),
             "lexical_candidates": len(lexical_ranked_indices),
             "semantic_candidates": len(semantic_ranked_indices),
             "rrf_k": RRF_K,
+            "semantic_rrf_weight": effective_semantic_weight if semantic_ranked_indices else 0.0,
             "spec_summary_preview": spec_summary[:200],
         },
-        "prompt_pack": _build_prompt_pack(top_all),
     }
+    return result
+
+
+def query_index(
+    index_dir: str | Path,
+    query_text: str,
+    code_text: str = "",
+    error_text: str = "",
+    top_k: int = 12,
+    per_group_k: int = 6,
+    min_project: int = 0,
+    min_tutorial: int = 0,
+    min_pdf: int = 0,
+    semantic_backend: str = "auto",
+    semantic_model: str | None = None,
+    semantic_proj_dim: int | None = None,
+    semantic_candidate_k: int = 1200,
+    lexical_rrf_weight: float = 1.0,
+    semantic_rrf_weight: float | None = None,
+    max_context_chars: int = 24000,
+) -> dict:
+    """Retrieve through the top-level LangChain LCEL pipeline."""
+    request = dict(locals())
+    from .pipeline import retrieve
+    return retrieve(request)

@@ -1,6 +1,6 @@
-# Verus RAG Knowledge Base
+# VeRAG
 
-A specialized knowledge base and local retrieval-augmented generation (RAG) system for Verus formal verification. It aggregates high-value external knowledge — official tutorial documentation, verified codebases from open-source repositories, and PDF references — and provides LLMs with precise, structured context for Verus proof debugging and specification generation.
+VeRAG is a specialized knowledge base and local LangChain RAG system for Verus formal verification. It aggregates high-value external knowledge — official tutorial documentation, verified codebases from open-source repositories, and PDF references — and provides LLMs with precise, structured context for Verus proof debugging and specification generation.
 
 ---
 
@@ -33,177 +33,172 @@ Production-grade verified projects providing complex, real-world proof patterns 
 
 ---
 
-## RAG System Architecture
+## Quick start
 
-The retrieval pipeline accepts three inputs — a natural language description, a Rust/Verus code snippet, and a Verus error message — and returns ranked, deduplicated evidence from three source groups: `project` (verified code), `tutorial` (docs), and `pdf` (slides/papers).
+Python 3.10+ is required. Install the package in a virtual environment:
 
-### Pipeline Overview
-
-```
-Input (query + code + error)
-        │
-        ▼
-┌─────────────────────────────┐
-│  Stage 1: Query Construction │  code_analyzer + error_cleaner
-│  - Extract spec tokens       │  ensures/requires/invariant → 3.5× weight
-│  - Detect proof patterns     │  e.g. min_element, sum_prefix, linear_search
-│  - Clean error message       │  strip paths/stack noise, expand error hints
-└──────────────┬──────────────┘
-               │
-       ┌───────┴───────┐
-       ▼               ▼
-┌─────────────┐  ┌──────────────────┐
-│  Stage 2    │  │    Stage 3        │
-│  BM25       │  │  Semantic Rerank  │
-│  Lexical    │  │  (spec_summary    │
-│  Ranking    │  │   as query)       │
-└──────┬──────┘  └────────┬─────────┘
-       └────────┬──────────┘
-                ▼
-┌───────────────────────────────┐
-│  Stage 4: RRF Fusion          │  Reciprocal Rank Fusion (k=60)
-│  + source priors + boosting   │  pdf > project > tutorial
-└──────────────┬────────────────┘
-               ▼
-┌───────────────────────────────┐
-│  Stage 5: Diversification     │  near-duplicate suppression
-│  + group minimum coverage     │  per-repo limit, group quotas
-└──────────────┬────────────────┘
-               ▼
-┌───────────────────────────────┐
-│  Stage 6: LLM Packaging       │  prompt_pack + optional --prompt-out
-└───────────────────────────────┘
+```sh
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[pdf]'
+verag build --repo-root . --index-dir .rag_index
+verag query --index-dir .rag_index \
+  --query-text "How do loop invariants establish a postcondition after a while loop?" \
+  --top-k 5 --prompt-out /tmp/verus-context.txt
 ```
 
-### Key Design Choices
+`python rag_cli.py` remains an alternative to the installed `verag` command.
+Build defaults to the deterministic **projection** backend, which uses hashed
+lexical/structural features, not a learned semantic model. No model download is
+required. `--semantic-backend none` builds/queries a lexical-only index.
 
-- **Spec-weighted BM25**: tokens from `ensures`/`requires`/`invariant` blocks are boosted 3.5× over regular code tokens, since spec clauses are far more semantically distinctive.
-- **Semantic backend**: uses a locally cached SentenceTransformer model when available; falls back to a projection-based embedding (offline-friendly, no model download required).
-- **Error cleaning**: strips file paths, line numbers, and stack noise from Verus error output; detects error categories (`postcondition`, `invariant`, `overflow`, `type_mismatch`, etc.) and expands them into domain-specific hint terms.
-- **PDF as first-class source**: PDF pages are chunked and windowed with overlap, and a minimum PDF quota is enforced in the final results.
-- **Diversification**: near-duplicate suppression (same file ±8 lines, Jaccard > 0.87), per-repo project cap (default 2), and two-phase group-minimum selection.
+For learned embeddings, install `pip install -e '.[pdf,semantic]'`, prepare a local
+SentenceTransformer model and build with `--semantic-backend sentence-transformer
+--semantic-model /path/to/model`. Models are loaded with `local_files_only=True`.
+At query time, `auto` uses the backend/model stored in the index. An explicit
+backend mismatch fails instead of silently using a different model. If vectors
+are unavailable, `auto` reports lexical fallback in `retrieval_debug`.
 
-For the full retrieval architecture, see [`rag/DESIGN.md`](rag/DESIGN.md).
+## LangChain orchestration
 
----
+The top-level framework is **LangChain LCEL**, supplied by `langchain-core`.
+CLI, `query_index()` and evaluation all invoke the same chain:
 
-## Setup
-
-**Install dependencies** (Python 3.9+):
-
-```bash
-pip install pypdf>=5.0.0
-# Optional: for SentenceTransformer semantic backend
-pip install sentence-transformers
+```text
+validate request -> Verus hybrid retrieval -> LangChain Documents -> evidence context
+                                                                    |
+                                                   optional chat prompt -> LLM -> answer
 ```
-
-**Repository layout:**
-
-```
-Verus_RAG_Knowledge/
-├── projects/          # Verified Verus projects (golden examples)
-│   ├── anvil-main/
-│   ├── verified-ironkv/
-│   ├── verismo/
-│   └── vest-main/
-├── tutorial/          # Docs, markdown guides, PDF references
-│   ├── verus/
-│   ├── vstd_api_md/
-│   ├── Verus_Tutorial_and_Reference.pdf
-│   └── Verus_Transition_Systems.pdf
-├── rag/               # Retrieval pipeline source code
-├── rag_cli.py         # CLI entry point
-└── .rag_index/        # Built index (generated, not committed)
-```
-
----
-
-## Usage
-
-### 1. Build the Index
-
-```bash
-python rag_cli.py build \
-  --repo-root . \
-  --index-dir .rag_index \
-  --pdf-roots ".,tutorial,docs" \
-  --force-tutorial-pdf
-```
-
-| Flag | Description |
-| --- | --- |
-| `--repo-root` | Root of the repository to index (default: `.`) |
-| `--index-dir` | Output directory for the built index |
-| `--pdf-roots` | Comma-separated directories to scan for PDF files |
-| `--force-tutorial-pdf` | Always include `tutorial/` in PDF discovery |
-
-The index is stored as `chunks.jsonl` and `meta.json` under `--index-dir`. Re-run with `--force` to rebuild from scratch.
-
-### 2. Query the Index
-
-```bash
-python rag_cli.py query \
-  --index-dir .rag_index \
-  --query-text "loop invariant fails for map update" \
-  --code-file /path/to/your_snippet.rs \
-  --error-file /path/to/verus_error.txt \
-  --top-k 12 \
-  --per-group-k 6 \
-  --min-project 2 \
-  --min-tutorial 2 \
-  --min-pdf 2 \
-  --semantic-backend auto \
-  --semantic-candidate-k 1200 \
-  --prompt-out /tmp/verus_rag_context.txt
-```
-
-| Flag | Description |
-| --- | --- |
-| `--query-text` | Natural language description of the problem |
-| `--code-file` | Path to the Rust/Verus source file |
-| `--error-file` | Path to the Verus error output |
-| `--top-k` | Total number of results to return |
-| `--per-group-k` | Max results per source group |
-| `--min-project/tutorial/pdf` | Minimum results from each source group |
-| `--semantic-backend` | `auto` (prefer local model), `projection` (offline), or `none` |
-| `--prompt-out` | Save the LLM-ready context block to a file |
-
-The output includes a `prompt_pack` field — a compact plain-text block ready for direct LLM context injection. If `--prompt-out` is specified, this block is also written to a file.
-
-### 3. Programmatic Usage
 
 ```python
-from rag.retriever import Retriever
+from rag import create_retrieval_chain, create_answer_chain
 
-retriever = Retriever(index_dir=".rag_index")
-results = retriever.query(
-    query_text="postcondition fails after loop",
-    code="fn foo(v: &Vec<u64>) ...",
-    error="postcondition not satisfied\n  ensures result == ...",
-    top_k=10,
-)
-print(results["prompt_pack"])
+chain = create_retrieval_chain()
+state = chain.invoke({
+    "index_dir": ".rag_index",
+    "query_text": "How do loop invariants establish a postcondition?",
+    "top_k": 5,
+})
+print(state["context"])
+print(state["documents"][0].metadata)  # LangChain Document, with citations
+
+# Supports invoke, ainvoke, batch and standard LangChain RunnableConfig/callbacks.
+# Supply any LangChain-compatible chat model to enable generation:
+# answer = create_answer_chain(chat_model).invoke({...})
+# print(answer["answer"])
 ```
 
----
+Retrieval needs no API credentials. The optional answer chain leaves provider/model
+selection to the application and retains source documents alongside the answer.
+It generates suggestions; it does not execute the Verus verifier. Unit tests use
+a local fake chat runnable to check evidence injection without calling an API.
 
-## Retrieval Quality
+## Inputs and outputs
 
-Batch evaluation on 16 representative Verus examples (April 2026):
+Queries accept any combination of English question, source code and Verus errors:
 
-| Metric | Value |
-| --- | --- |
-| Examples scored HIGH | 16 / 16 |
-| PDF hits relevant | ~100% |
-| Tutorial hits relevant | ~75% |
-| Noise documents in top-8 | 0% |
+```sh
+verag query --query-text "Why does this loop invariant fail?" \
+  --code-file /path/to/example.rs --error-file /path/to/error.txt
+```
 
-Key error categories and their typical retrieval targets:
+```python
+from rag import build_index, query_index
 
-| Error Category | Retrieved Sources |
-| --- | --- |
-| `postcondition + invariant` | `while.md`, PDF loop chapters, project loop proofs |
-| `overflow` | `integers.md`, `CheckedU128.md`, PDF integer chapters |
-| `type_mismatch (E0308)` | `reference-as.md`, `integers.md`, `exec_spec.md` |
-| `missing_item (E0599)` | `vstd_api` docs, vec/seq library chunks |
-| `old_ref` | `mut-ref.md`, `requires-ensures.md` |
+build_index(".", ".rag_index", include_pdfs=False, semantic_backend="projection")
+result = query_index(".rag_index", "How do I prove a loop invariant?", top_k=5)
+print(result["prompt_pack"])
+```
+
+Results expose full `text`, UI-only `snippet`, source lines/pages, included-code
+provenance, symbol hints, lexical/semantic/RRF scores and `index_generation`.
+`score` is the RRF score actually used for final ranking. `prompt_pack` preserves
+full evidence blocks and formatting, up to `--max-context-chars` (default 24000);
+a block that cannot fit is skipped, never truncated. This is a character budget,
+not a model-token guarantee. Full evidence remains available in the JSON output.
+
+There are no forced source quotas by default. `--min-project`, `--min-tutorial`
+and `--min-pdf` opt into legacy minimum coverage. `--per-group-k` controls only
+the separate `grouped` diagnostic lists, not the final result list.
+
+## Retrieval architecture
+
+1. **Ingest:** discover project Rust, tutorial Markdown/text and optional PDFs.
+2. **Chunk:** conservatively preserve function regions, Markdown paragraphs and
+   fenced code. Generic types, indentation and real document line numbers survive.
+   The Rust chunker is lexical, not a complete Verus AST parser; it may include
+   adjacent declarations/module braces. Unrecognized code falls back to line regions.
+3. **Includes:** expand available local mdBook includes and named anchors, retaining
+   referenced file/line provenance. Missing/out-of-snapshot/unsupported includes
+   get an explicit unavailable marker and a manifest entry. The vendored guide
+   currently references example files absent from its snapshot; these are not fetched
+   or invented automatically.
+4. **Index:** persist term counts and normalized document vectors in an immutable
+   generation; publish `meta.json` atomically only after a successful build.
+5. **Retrieve:** independently search BM25 and the stored vector corpus; combine
+   candidates with RRF. Only the query is embedded at request time. Default vector
+   RRF weight is 0.25 for feature hashing and 0.9 for learned embeddings; override
+   with `--semantic-rrf-weight`. Projection is intentionally a weaker ranking signal.
+6. **Select:** remove overlapping/near-duplicate evidence and limit project-repo
+   concentration; build a context from complete evidence blocks.
+
+Index layout:
+
+```text
+.rag_index/
+  meta.json                    # active generation and embedding configuration
+  generations/<generation>/
+    meta.json
+    chunks.jsonl
+    lexical.json
+    vectors.npy                # absent for lexical-only builds
+```
+
+Rebuilding creates a new generation and invalidates warm caches by snapshot path.
+Failed builds leave the active generation usable. Older generations are retained;
+remove them only when no readers use them. Legacy root-level `chunks.jsonl` indexes
+remain readable (lexical fallback); rebuild to get structural chunks and vectors.
+Builds currently scan the complete corpus; incremental updates and automatic
+snapshot garbage collection are future work.
+
+## Tests and local evaluation
+
+```sh
+python -m unittest discover -s tests -v
+verag evaluate --index-dir .rag_index \
+  --cases evaluation/smoke_cases.jsonl --output .rag_eval/smoke.json
+```
+
+Unit tests use a small committed corpus and no network. They cover loop-invariant
+questions, error-only retrieval, overflow, quantifiers, include citations, complete
+context, independent vector recall, rebuild cache invalidation and failed-build
+rollback. Evaluation runs English questions against the actual local knowledge
+corpus, including loop invariants and loop isolation, and exits nonzero on a missed
+target document. These are development smoke checks, not a held-out accuracy claim.
+
+## Repository layout
+
+```text
+rag/                  # installable Python library and CLI
+  pipeline.py         # LangChain LCEL retrieval and optional answer chains
+  chunking.py         # source-preserving lexical/Markdown chunking
+  includes.py         # local mdBook include resolution
+  index_builder.py    # source discovery and snapshot builds
+  storage.py          # schema validation and atomic manifests
+  retriever.py        # BM25, independent vector recall, RRF and selection
+  semantic.py         # embedding providers
+  prompting.py        # shared full-evidence context renderer
+  evaluation.py       # document-target smoke evaluation
+projects/             # upstream verified-project snapshots
+tutorial/            # upstream tutorials/API documentation/PDFs
+tests/               # isolated offline regressions and fixture corpus
+evaluation/          # English full-corpus smoke questions
+docs/                # architecture roadmap
+.github/workflows/    # Python test matrix
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [current design](rag/DESIGN.md), and the
+[detailed refactor roadmap](docs/RAG_REFACTOR_PLAN.md). Third-party snapshots retain
+their upstream licenses. This repository does not yet declare a root package license.
+
+Repository publication policy: [included and excluded content](docs/REPOSITORY_CONTENTS.md).

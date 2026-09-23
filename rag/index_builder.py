@@ -1,4 +1,4 @@
-"""Index builder for Verus RAG retrieval."""
+"""Index builder for VeRAG retrieval."""
 
 from __future__ import annotations
 
@@ -7,11 +7,17 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+import uuid
+import shutil
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Iterable
 
 from .tokenize import token_counts
+from .chunking import code_chunks, document_chunks
+from .storage import SCHEMA_VERSION, publish_manifest
+from .includes import expand_includes
+from .semantic import SemanticConfig, SemanticScorer
 
 CODE_EXTENSIONS = {".rs"}
 DOC_EXTENSIONS = {".md", ".txt", ".rst"}
@@ -41,6 +47,10 @@ class Chunk:
     tags: list[str]
     token_len: int
     text_hash: str
+    chunk_kind: str = "text"
+    symbol: str = ""
+    parse_quality: str = "lexical"
+    includes: list[dict] = field(default_factory=list)
 
 
 def _iter_files(
@@ -86,8 +96,8 @@ def _walk_files(base: Path) -> Iterable[Path]:
     Using os.walk here is more predictable than rglob for very large trees.
     """
     for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIR_NAMES]
-        for name in filenames:
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIR_NAMES)
+        for name in sorted(filenames):
             path = Path(dirpath) / name
             if any(part in IGNORE_DIR_NAMES for part in path.parts):
                 continue
@@ -95,35 +105,15 @@ def _walk_files(base: Path) -> Iterable[Path]:
 
 
 def _chunk_code_lines(lines: list[str]) -> list[tuple[int, int, str]]:
-    chunks: list[tuple[int, int, str]] = []
-    i = 0
-    total = len(lines)
-    while i < total:
-        end = min(total, i + CODE_LINE_CHUNK)
-        block = "".join(lines[i:end]).strip()
-        if block:
-            chunks.append((i + 1, end, block))
-        if end == total:
-            break
-        i += CODE_LINE_CHUNK - CODE_LINE_OVERLAP
-    return chunks
+    return code_chunks("".join(lines))
 
 
 def _chunk_doc_text(
     text: str, chunk_size: int = DOC_CHAR_CHUNK, overlap: int = DOC_CHAR_OVERLAP
 ) -> list[tuple[int, int, str]]:
-    chunks: list[tuple[int, int, str]] = []
-    start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = min(text_len, start + chunk_size)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append((1, 1, chunk))
-        if end == text_len:
-            break
-        start += chunk_size - overlap
-    return chunks
+    # Keep the old function signature for callers; overlap is superseded by
+    # structural boundaries, preserving code fences and original line numbers.
+    return document_chunks(text, target_chars=chunk_size)
 
 
 def _read_pdf_pages(path: Path) -> tuple[list[tuple[int, str]], str]:
@@ -153,10 +143,8 @@ def _read_text(path: Path) -> str:
 
 
 def _clean_doc_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip()
+    # Source text is evidence: never strip angle brackets, indentation or lines.
+    return text.replace("\x00", "")
 
 
 def _infer_tags(text: str) -> list[str]:
@@ -188,8 +176,7 @@ def _guess_title(path: Path, text: str) -> str:
 
 
 def _hash_text(text: str) -> str:
-    compact = " ".join(text.split())
-    return hashlib.md5(compact.encode("utf-8")).hexdigest()  # noqa: S324
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def build_index(
@@ -197,12 +184,22 @@ def build_index(
     output_dir: str | Path = ".rag_index",
     include_pdfs: bool = True,
     pdf_roots: list[str] | None = None,
+    semantic_backend: str = "projection",
+    semantic_model: str = "all-MiniLM-L6-v2",
+    semantic_proj_dim: int = 512,
 ) -> dict:
     root = Path(repo_root).resolve()
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
+    if not root.is_dir():
+        raise ValueError(f"Source root does not exist: {root}")
+    if semantic_backend not in {"none", "projection", "sentence-transformer", "auto"}:
+        raise ValueError(f"Unknown semantic backend: {semantic_backend}")
+    if semantic_proj_dim <= 0:
+        raise ValueError("semantic_proj_dim must be positive")
     chunks: list[Chunk] = []
+    include_references: list[dict] = []
     idx = 0
     discovered_counts = {"project_files": 0, "tutorial_files": 0, "pdf_files": 0}
     discovered_pdf_files: list[str] = []
@@ -267,6 +264,10 @@ def build_index(
         rel = str(file_path.relative_to(root))
         title = _guess_title(file_path, raw)
         for line_start, line_end, text in chunked:
+            references = []
+            if source_group == "tutorial":
+                text, references = expand_includes(text, file_path, root)
+                include_references.extend({"document": rel, **ref} for ref in references)
             tks = token_counts(text)
             chunks.append(
                 Chunk(
@@ -283,14 +284,21 @@ def build_index(
                     tags=_infer_tags(text),
                     token_len=sum(tks.values()),
                     text_hash=_hash_text(text),
+                    includes=references,
                 )
             )
             idx += 1
 
-    chunks_path = out / "chunks.jsonl"
-    with chunks_path.open("w", encoding="utf-8") as f:
-        for c in chunks:
-            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
+    # Content-addressed IDs stay stable across identical rebuilds.
+    for chunk in chunks:
+        identity = f"{chunk.path}:{chunk.page}:{chunk.line_start}:{chunk.line_end}:{chunk.text_hash}"
+        chunk.id = hashlib.sha256(identity.encode()).hexdigest()[:24]
+        if chunk.lang == "rust":
+            match = re.search(r"\bfn\s+([A-Za-z_]\w*)", chunk.text)
+            chunk.chunk_kind = "function_region" if match else "code_region"
+            chunk.symbol = match.group(1) if match else ""
+        else:
+            chunk.chunk_kind = "pdf_section" if chunk.page else "doc_section"
 
     # Persist minimal stats for quick loading.
     doc_lens = [c.token_len for c in chunks]
@@ -306,6 +314,10 @@ def build_index(
         "pdf": len({c.path for c in chunks if c.source_group == "pdf"}),
     }
     metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "generation": uuid.uuid4().hex,
+        "chunker_version": "source-preserving-v2",
+        "include_references": include_references,
         "repo_root": str(root),
         "chunk_count": len(chunks),
         "avg_token_len": avg_len,
@@ -331,9 +343,34 @@ def build_index(
             "failed_pdf_examples": pdf_parse_failures[:20],
         },
     }
-    (out / "meta.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    snapshot = out / "generations" / metadata["generation"]
+    snapshot.mkdir(parents=True)
+    try:
+        with (snapshot / "chunks.jsonl").open("w", encoding="utf-8") as f:
+            for chunk in chunks:
+                f.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
+        # Persist sparse term counts once, rather than retokenizing on each CLI run.
+        (snapshot / "lexical.json").write_text(
+            json.dumps([dict(token_counts(c.text)) for c in chunks]), encoding="utf-8"
+        )
+        metadata["embedding"] = {"backend": "none"}
+        if semantic_backend != "none" and chunks:
+            import numpy as np
+            scorer = SemanticScorer(SemanticConfig(semantic_backend, semantic_model, semantic_proj_dim))
+            vectors = scorer.embed([c.text for c in chunks]).astype(np.float32)
+            np.save(snapshot / "vectors.npy", vectors, allow_pickle=False)
+            metadata["embedding"] = {
+                "backend": scorer.backend_name,
+                "model": semantic_model,
+                "dimension": int(vectors.shape[1]),
+                "projection_dimension": semantic_proj_dim,
+                "degraded_reason": scorer.degraded_reason,
+            }
+        (snapshot / "meta.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        publish_manifest(out, metadata)
+    except Exception:
+        shutil.rmtree(snapshot)
+        raise
     if include_pdfs and discovered_counts["pdf_files"] > 0 and len(parsed_pdf_file_set) == 0:
         print(
             "[WARN] Found PDF files but parsed 0 successfully. "

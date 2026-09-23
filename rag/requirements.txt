@@ -1,2 +1,4 @@
-# Optional dependency for PDF parsing:
+# Compatibility installation; prefer `pip install -e '.[pdf]'` at repository root.
+numpy>=1.24
 pypdf>=5.0.0
+langchain-core>=0.3.79,<2

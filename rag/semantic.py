@@ -10,16 +10,11 @@ The projection backend is enhanced to be spec-aware:
 from __future__ import annotations
 
 import hashlib
-import math
-import re
-from pathlib import Path
 
-# 本地嵌入模型路径（与 rag/model/ 目录对齐）
-_RAG_DIR = Path(__file__).resolve().parent
-_LOCAL_MODEL_PATH = str(_RAG_DIR / "model")
 from dataclasses import dataclass
 
 from .tokenize import tokenize
+from .code_analyzer import _extract_spec_clauses
 
 try:
     import numpy as np
@@ -27,12 +22,6 @@ except Exception:  # pragma: no cover
     np = None
 
 # ── Spec-context extraction for enhanced projection ──────────────────────────
-
-_SPEC_BLOCK_RE = re.compile(
-    r"\b(ensures|requires|invariant|decreases)\b(.*?)(?=\brequires\b|\bensures\b"
-    r"|\binvariant\b|\bdecreases\b|\{|$)",
-    re.DOTALL,
-)
 
 # Verus spec keywords that should get boosted embedding weight
 _SPEC_KEYWORDS = frozenset({
@@ -44,11 +33,7 @@ _SPEC_KEYWORDS = frozenset({
 
 def _extract_spec_tokens(text: str) -> list[str]:
     """Return tokens extracted specifically from spec clause bodies."""
-    spec_tokens: list[str] = []
-    for m in _SPEC_BLOCK_RE.finditer(text):
-        body = m.group(2)
-        spec_tokens.extend(tokenize(body))
-    return spec_tokens
+    return tokenize(" ".join(_extract_spec_clauses(text).values()))
 
 
 def _structural_fingerprint(text: str) -> dict[str, int]:
@@ -72,7 +57,7 @@ def _structural_fingerprint(text: str) -> dict[str, int]:
 @dataclass
 class SemanticConfig:
     backend: str = "auto"  # auto | sentence-transformer | projection
-    model_name: str = _LOCAL_MODEL_PATH   # 优先使用本地模型
+    model_name: str = "all-MiniLM-L6-v2"
     proj_dim: int = 512   # increased from 256 for better capacity
 
 
@@ -148,7 +133,12 @@ def _cosine(query_vec, matrix):
 
 class SemanticScorer:
     def __init__(self, config: SemanticConfig):
+        if config.backend not in {"auto", "sentence-transformer", "projection"}:
+            raise ValueError(f"Unknown embedding backend: {config.backend}")
+        if config.proj_dim <= 0:
+            raise ValueError("Projection dimension must be positive")
         self.config = config
+        self.degraded_reason = ""
         self._backend = "projection"
         self._st_model = None
         if config.backend in ("auto", "sentence-transformer"):
@@ -158,7 +148,8 @@ class SemanticScorer:
                 # local_files_only avoids long network retries in offline environments.
                 self._st_model = SentenceTransformer(config.model_name, local_files_only=True)
                 self._backend = "sentence-transformer"
-            except Exception:
+            except Exception as exc:
+                self.degraded_reason = f"Local model unavailable: {type(exc).__name__}"
                 if config.backend == "sentence-transformer":
                     raise
                 self._backend = "projection"
@@ -172,7 +163,7 @@ class SemanticScorer:
             raise RuntimeError("numpy is required for semantic scoring")
         if self._backend == "sentence-transformer":
             emb = self._st_model.encode(texts, normalize_embeddings=True)  # type: ignore
-            return np.asarray(emb, dtype=float)
+            return np.asarray(emb, dtype=np.float32)
         emb = np.stack([_projection_embed(t, self.config.proj_dim) for t in texts], axis=0)
         return emb
 

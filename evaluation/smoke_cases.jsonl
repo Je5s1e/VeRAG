@@ -1,0 +1,6 @@
+{"id":"loop-basics","query":"How do loop invariants hold before and after each iteration of a while loop?","expected_paths":["tutorial/verus/while.md"]}
+{"id":"loop-exit","query":"How does the negated loop condition and loop invariant prove the postcondition after the loop exits?","expected_paths":["tutorial/verus/while.md"]}
+{"id":"loop-error","query":"Why must an invariant hold before the first iteration?","error":"error: invariant not satisfied before loop","expected_paths":["tutorial/verus/while.md"]}
+{"id":"loop-isolation","query":"Why do loops not automatically inherit the function preconditions? loop_isolation(false)","expected_paths":["tutorial/verus/while.md"]}
+{"id":"integer-types","query":"What is the difference between mathematical int nat and fixed width u64 integer types?","expected_paths":["tutorial/verus/integers.md"]}
+{"id":"mutable-reference","query":"How do I use old with mutable references in requires and ensures?","expected_paths":["tutorial/verus/requires-ensures-mut-ref.md"]}
